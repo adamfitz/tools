@@ -1,7 +1,9 @@
 [alias]
 	cia = commit --amend --no-edit
-	# last 10 commits on one line with time
 	lol = log --oneline --graph --pretty=format:'%C(auto)%h%d (%cr) %s' -10
-	# example of last 10 commits on one line with contributor name and email
-	# lol = log --graph --pretty=format:'%C(auto)%h%d (%cr) %cn <%ce> %s'
 	co = checkout
+	fa = fetch --all
+	pf = push --force
+[core]
+	editor = vim
+
