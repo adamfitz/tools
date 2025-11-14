@@ -35,8 +35,13 @@ RUN adduser --system --ingroup frr --home /var/opt/frr/ --gecos "FRR suite" --sh
 RUN usermod -a -G frrvty frr
 
 # download and build frr
-RUN git clone https://github.com/frrouting/frr.git /tmp/frr
+RUN rm -rf /tmp/frr
+RUN date >> /dev/null && git clone https://github.com/adamfitz/frr.git /tmp/frr
 WORKDIR /tmp/frr
+RUN git reset --hard origin/ping_repeat
+RUN git fetch --all
+RUN git checkout ping_repeat
+RUN git pull 
 RUN ./bootstrap.sh
 RUN ./configure \
     --sysconfdir=/etc \
