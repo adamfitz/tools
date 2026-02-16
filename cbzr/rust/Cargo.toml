@@ -1,0 +1,14 @@
+[package]
+name = "cbzr"
+version = "0.1.0"
+edition = "2021"
+
+# dependencies
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+
+# binary configuration
+[[bin]]
+name = "cbzr"
+path = "src/cbzr.rs"
