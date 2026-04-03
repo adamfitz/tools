@@ -2,6 +2,7 @@ use clap::{Arg, Command};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use regex::Regex;
 
 fn main() {
     let matches = Command::new("cbzr")
@@ -78,14 +79,28 @@ fn main() {
             continue;
         }
 
-        // Extract leading number (e.g., 019.cbz → 019)
-        let number = file_name.split('.').next().unwrap();
-        if !number.chars().all(|c| c.is_digit(10)) {
-            println!("Skipping {}: no leading number found", file_name);
-            continue;
-        }
+        // Extract the chapter number from the filename using regex
+        // (?i) → case-insensitive (Chapter, CH, etc.)
+        // (?:c|ch|chap|chapter) → all supported prefixes
+        // [\s._-]* → allows separators:
+        // chapter123
+        // chapter.123
+        // chapter_123
+        // chapter-123
+        // (\d{1,4}) → captures the number (adjust upper bound if needed)
+        // \b → avoids weird matches inside longer strings
+        let re = Regex::new(r"(?i)\b(?:c|ch|chap|chapter)[\s._-]*(\d{1,4})\b").unwrap();
 
-        let new_name = format!("ch{}.cbz", number);
+        let number = match re.captures(&file_name) {
+            Some(caps) => caps.get(1).unwrap().as_str(),
+            None => {
+                println!("Skipping {}: no chapter number found", file_name);
+                continue;
+            }
+        };
+
+        // Generate new filename with three digit chapter numbers
+        let new_name = format!("ch{:03}.cbz", number.parse::<u32>().unwrap());
         let target_path = dir.join(new_name.clone());
 
         if apply {
