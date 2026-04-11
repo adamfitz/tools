@@ -1,8 +1,8 @@
 use clap::{Arg, Command};
+use regex::Regex;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use regex::Regex;
 
 fn main() {
     let matches = Command::new("cbzr")
@@ -16,14 +16,14 @@ fn main() {
                 .value_name("PATH")
                 .help("Directory containing CBZ files")
                 .num_args(1)
-                .required(true) // <- require the argument
+                .required(true),
         )
         .arg(
             Arg::new("apply")
                 .short('a')
                 .long("apply")
                 .help("Actually apply changes instead of dry-run")
-                .action(clap::ArgAction::SetTrue)
+                .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -49,9 +49,14 @@ fn main() {
         let path = entry.path();
         if path.extension().map(|s| s == "tmp").unwrap_or(false) {
             let target = path.with_extension("cbz");
-            println!("[RECOVER] {:?} → {:?}", path.file_name().unwrap(), target.file_name().unwrap());
+            println!(
+                "[RECOVER] {:?} → {:?}",
+                path.file_name().unwrap(),
+                target.file_name().unwrap()
+            );
             if apply {
-                fs::rename(&path, &target).unwrap_or_else(|e| eprintln!("Failed to recover {:?}: {}", path, e));
+                fs::rename(&path, &target)
+                    .unwrap_or_else(|e| eprintln!("Failed to recover {:?}: {}", path, e));
             }
         }
     }
@@ -71,41 +76,57 @@ fn main() {
 
     files.sort();
 
+    // Precompile regex
+    let chapter_re =
+        Regex::new(r"(?i)\b(?:c|ch|chap|chapter)[\s._-]*(\d+(?:\.\d+)?)\b").unwrap();
+
+    let fallback_re =
+        Regex::new(r"[._-](\d{1,4}(?:\.\d+)?)[._-]").unwrap();
+
+    let year_re = Regex::new(r"\((19|20)\d{2}\)").unwrap();
+
     for file in files {
         let file_name = file.file_name().unwrap().to_string_lossy();
+
         // Skip already renamed
         if file_name.starts_with("ch") {
             println!("Skipping already renamed file: {}", file_name);
             continue;
         }
 
-        // Extract the chapter number from the filename using regex
-        // (?i) → case-insensitive (Chapter, CH, etc.)
-        // (?:c|ch|chap|chapter) → all supported prefixes
-        // [\s._-]* → allows separators:
-        // chapter123
-        // chapter.123
-        // chapter_123
-        // chapter-123
-        // (\d{1,4}) → captures the number (adjust upper bound if needed)
-        // \b → avoids weird matches inside longer strings
-        let re = Regex::new(r"(?i)\b(?:c|ch|chap|chapter)[\s._-]*(\d{1,4})\b").unwrap();
+        // Extract chapter number
+        let number = if let Some(caps) = chapter_re.captures(&file_name) {
+            caps.get(1).unwrap().as_str().to_string()
+        } else {
+            // Remove year to avoid false match
+            let cleaned = year_re.replace_all(&file_name, "");
 
-        let number = match re.captures(&file_name) {
-            Some(caps) => caps.get(1).unwrap().as_str(),
-            None => {
-                println!("Skipping {}: no chapter number found", file_name);
-                continue;
+            match fallback_re.captures_iter(&cleaned).last() {
+                Some(caps) => caps.get(1).unwrap().as_str().to_string(),
+                None => {
+                    println!("Skipping {}: no chapter number found", file_name);
+                    continue;
+                }
             }
         };
 
-        // Generate new filename with three digit chapter numbers
-        let new_name = format!("ch{:03}.cbz", number.parse::<u32>().unwrap());
+        // Generate new filename
+        let new_name = if number.contains('.') {
+            format!("ch{}.cbz", number)
+        } else {
+            match number.parse::<u32>() {
+                Ok(n) => format!("ch{:03}.cbz", n),
+                Err(_) => {
+                    println!("Skipping {}: invalid number '{}'", file_name, number);
+                    continue;
+                }
+            }
+        };
+
         let target_path = dir.join(new_name.clone());
 
         if apply {
             if target_path.exists() {
-                // Ask before overwriting
                 print!("mv: overwrite '{}'? [y/N] ", target_path.display());
                 io::stdout().flush().unwrap();
                 let mut input = String::new();
@@ -117,13 +138,23 @@ fn main() {
             }
 
             let tmp_path = target_path.with_extension("cbz.tmp");
+
             fs::rename(&file, &tmp_path).unwrap_or_else(|e| {
                 eprintln!("Failed to rename {:?} → {:?}: {}", file, tmp_path, e);
             });
+
             fs::rename(&tmp_path, &target_path).unwrap_or_else(|e| {
-                eprintln!("Failed to finalize {:?} → {:?}: {}", tmp_path, target_path, e);
+                eprintln!(
+                    "Failed to finalize {:?} → {:?}: {}",
+                    tmp_path, target_path, e
+                );
             });
-            println!("Renamed {:?} → {:?}", file.file_name().unwrap(), target_path.file_name().unwrap());
+
+            println!(
+                "Renamed {:?} → {:?}",
+                file.file_name().unwrap(),
+                target_path.file_name().unwrap()
+            );
         } else {
             println!("[DRY RUN] {} → {}", file_name, new_name);
         }
