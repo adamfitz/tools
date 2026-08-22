@@ -13,7 +13,7 @@ usage() {
   echo ""
   echo "Options:"
   echo "  -a, --audio    Download audio only as MP3"
-  echo "  -v, --video    Download video"
+  echo "  -v, --video    Download video with audio"
   echo "  -h, --help     Show this help"
   echo ""
   echo "Examples:"
@@ -127,12 +127,33 @@ if ! yt-dlp --version >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "yt-dlp version: $(yt-dlp --version)"
+
+# ----------------------------
+# Check required dependencies
+# ----------------------------
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq not found or not in PATH."
+  exit 1
+fi
+
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "Error: ffprobe not found or not in PATH."
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Error: ffmpeg not found or not in PATH."
+  echo "ffmpeg is required for video + audio downloads."
+  exit 1
+fi
+
 # ----------------------------
 # Setup
 # ----------------------------
 mkdir -p "$OUTPUT_DIR"
 
-# Keep separate archives for audio and video.
+# Separate archives for audio and video.
 ARCHIVE_FILE="$OUTPUT_DIR/.downloaded-${MODE}.txt"
 
 touch "$ARCHIVE_FILE"
@@ -173,40 +194,87 @@ for ID in $IDS; do
   echo "Processing: $ID"
 
   # ----------------------------
-  # Set expected extension
+  # Find existing file
   # ----------------------------
   if [ "$MODE" = "audio" ]; then
-    EXT="mp3"
-  else
-    EXT="mp4"
-  fi
 
-  # Find an existing file containing [VIDEO_ID]
-  FILE=$(find "$OUTPUT_DIR" \
-    -maxdepth 1 \
-    -type f \
-    -name "*[$ID].$EXT" \
-    -print -quit)
+    FILE=$(find "$OUTPUT_DIR" \
+      -maxdepth 1 \
+      -type f \
+      -name "*[$ID].mp3" \
+      -print -quit)
+
+  else
+
+    # Do not assume mp4/webm/mkv/etc.
+    FILE=$(find "$OUTPUT_DIR" \
+      -maxdepth 1 \
+      -type f \
+      -name "*[$ID].*" \
+      ! -name "*.part" \
+      ! -name "*.ytdl" \
+      -print -quit)
+
+  fi
 
   # ----------------------------
   # Check existing file
   # ----------------------------
   if [ -n "$FILE" ] && [ -f "$FILE" ]; then
 
-    if ffprobe -v error "$FILE" >/dev/null 2>&1; then
-      echo "OK (file exists + valid): $ID"
+    if [ "$MODE" = "audio" ]; then
 
-      # Add ID to archive if missing.
-      grep -qxF "$ID" "$ARCHIVE_FILE" || \
-        echo "$ID" >> "$ARCHIVE_FILE"
+      # Audio must contain an audio stream.
+      AUDIO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams a \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
 
-      continue
+      if [ "$AUDIO_STREAMS" -gt 0 ]; then
+        echo "OK (audio file exists + valid): $ID"
+        echo "File: $(basename "$FILE")"
+
+        grep -qxF "$ID" "$ARCHIVE_FILE" || \
+          echo "$ID" >> "$ARCHIVE_FILE"
+
+        continue
+      fi
 
     else
-      echo "Corrupt file detected → re-downloading: $ID"
 
-      rm -f "$FILE"
+      # Video must contain BOTH video and audio streams.
+      VIDEO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams v \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
+
+      AUDIO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams a \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
+
+      if [ "$VIDEO_STREAMS" -gt 0 ] && [ "$AUDIO_STREAMS" -gt 0 ]; then
+        echo "OK (video + audio exists + valid): $ID"
+        echo "File: $(basename "$FILE")"
+
+        grep -qxF "$ID" "$ARCHIVE_FILE" || \
+          echo "$ID" >> "$ARCHIVE_FILE"
+
+        continue
+      fi
+
     fi
+
+    echo "Invalid/incomplete file detected → deleting: $ID"
+    echo "File: $(basename "$FILE")"
+
+    rm -f "$FILE"
 
   else
     echo "Missing file → downloading: $ID"
@@ -214,9 +282,6 @@ for ID in $IDS; do
 
   # ----------------------------
   # Remove ID from archive
-  #
-  # This allows a missing/corrupt file
-  # to be downloaded again.
   # ----------------------------
   grep -vxF "$ID" "$ARCHIVE_FILE" > "$ARCHIVE_FILE.tmp" || true
   mv "$ARCHIVE_FILE.tmp" "$ARCHIVE_FILE"
@@ -230,7 +295,7 @@ for ID in $IDS; do
 
     setsid yt-dlp \
       --cookies "$COOKIES_FILE" \
-      -f "ba" \
+      -f "bestaudio" \
       -x \
       --audio-format mp3 \
       --no-overwrites \
@@ -243,12 +308,16 @@ for ID in $IDS; do
 
   else
 
-    echo "Downloading video: $ID"
+    echo "Downloading video + audio: $ID"
 
+    # Best video + best audio.
+    #
+    # No forced container.
+    # yt-dlp/ffmpeg chooses the appropriate container
+    # for the selected streams.
     setsid yt-dlp \
       --cookies "$COOKIES_FILE" \
-      -f "bv*+ba/b" \
-      --merge-output-format mp4 \
+      -f "bestvideo*+bestaudio/best" \
       --no-overwrites \
       --retries 10 \
       --fragment-retries 10 \
@@ -256,6 +325,7 @@ for ID in $IDS; do
       --restrict-filenames \
       -o "$OUTPUT_DIR/%(title).200B [%(id)s].%(ext)s" \
       "https://www.youtube.com/watch?v=$ID" &
+
   fi
 
   # ----------------------------
@@ -278,27 +348,92 @@ for ID in $IDS; do
   # ----------------------------
   # Find downloaded file
   # ----------------------------
-  FILE=$(find "$OUTPUT_DIR" \
-    -maxdepth 1 \
-    -type f \
-    -name "*[$ID].$EXT" \
-    -print -quit)
+  if [ "$MODE" = "audio" ]; then
+
+    FILE=$(find "$OUTPUT_DIR" \
+      -maxdepth 1 \
+      -type f \
+      -name "*[$ID].mp3" \
+      -print -quit)
+
+  else
+
+    FILE=$(find "$OUTPUT_DIR" \
+      -maxdepth 1 \
+      -type f \
+      -name "*[$ID].*" \
+      ! -name "*.part" \
+      ! -name "*.ytdl" \
+      -print -quit)
+
+  fi
 
   # ----------------------------
   # Validate downloaded file
   # ----------------------------
   if [ -n "$FILE" ] && [ -f "$FILE" ]; then
 
-    if ffprobe -v error "$FILE" >/dev/null 2>&1; then
+    if [ "$MODE" = "audio" ]; then
 
-      grep -qxF "$ID" "$ARCHIVE_FILE" || \
-        echo "$ID" >> "$ARCHIVE_FILE"
+      AUDIO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams a \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
 
-      echo "OK → archived"
+      if [ "$AUDIO_STREAMS" -gt 0 ]; then
+
+        grep -qxF "$ID" "$ARCHIVE_FILE" || \
+          echo "$ID" >> "$ARCHIVE_FILE"
+
+        echo "OK → audio validated → archived"
+        echo "File: $(basename "$FILE")"
+
+      else
+
+        echo "ERROR → downloaded file contains no audio"
+        echo "Deleting: $(basename "$FILE")"
+
+        rm -f "$FILE"
+
+      fi
 
     else
-      echo "Corrupt after download → deleting"
-      rm -f "$FILE"
+
+      VIDEO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams v \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
+
+      AUDIO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams a \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
+
+      if [ "$VIDEO_STREAMS" -gt 0 ] && [ "$AUDIO_STREAMS" -gt 0 ]; then
+
+        grep -qxF "$ID" "$ARCHIVE_FILE" || \
+          echo "$ID" >> "$ARCHIVE_FILE"
+
+        echo "OK → video + audio validated → archived"
+        echo "File: $(basename "$FILE")"
+
+      else
+
+        echo "ERROR → downloaded file does not contain both video and audio"
+        echo "Video streams: $VIDEO_STREAMS"
+        echo "Audio streams: $AUDIO_STREAMS"
+        echo "Deleting: $(basename "$FILE")"
+
+        rm -f "$FILE"
+
+      fi
+
     fi
 
   else
