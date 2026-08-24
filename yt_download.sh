@@ -6,6 +6,7 @@ ARCHIVE_FILE=""
 COOKIES_FILE="$HOME/cookies.txt"
 
 MODE=""
+DELETE_DUPLICATES=false
 CURRENT_PGID=""
 
 usage() {
@@ -14,6 +15,7 @@ usage() {
   echo "Options:"
   echo "  -a, --audio    Download audio only as MP3"
   echo "  -v, --video    Download video with audio"
+  echo "  -d, --delete   Delete newer duplicate MP3 files, keeping the oldest copy"
   echo "  -h, --help     Show this help"
   echo ""
   echo "Examples:"
@@ -21,6 +23,94 @@ usage() {
   echo "  $0 --video \"https://www.youtube.com/playlist?list=XXXX\""
   echo "  $0 --audio \"https://www.youtube.com/watch?v=XXXX\""
   echo "  $0 --video \"https://www.youtube.com/watch?v=XXXX\""
+}
+
+cleanup_duplicates() {
+  echo ""
+  echo "===================================="
+  echo "Checking for duplicate MP3 files"
+  echo "===================================="
+
+  declare -A oldest_file
+  declare -A oldest_time
+  declare -A duplicate_count
+
+  while IFS= read -r -d '' file; do
+    if [[ "$file" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]]; then
+      ID="${BASH_REMATCH[1]}"
+    else
+      continue
+    fi
+
+    MTIME=$(stat -c '%Y' "$file")
+
+    if [[ -z "${oldest_file[$ID]+x}" ]]; then
+      oldest_file["$ID"]="$file"
+      oldest_time["$ID"]="$MTIME"
+      duplicate_count["$ID"]=1
+    else
+      duplicate_count["$ID"]=$((duplicate_count["$ID"] + 1))
+
+      if (( MTIME < oldest_time["$ID"] )); then
+        oldest_file["$ID"]="$file"
+        oldest_time["$ID"]="$MTIME"
+      fi
+    fi
+  done < <(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mp3' -print0)
+
+  TOTAL=0
+  REMOVED=0
+
+  for ID in "${!duplicate_count[@]}"; do
+    COUNT="${duplicate_count[$ID]}"
+
+    (( COUNT > 1 )) || continue
+
+    TOTAL=$((TOTAL + COUNT - 1))
+    KEEP="${oldest_file[$ID]}"
+
+    echo ""
+    echo "YouTube ID: $ID"
+    echo "KEEP (oldest):"
+    echo "  $(basename "$KEEP")"
+
+    while IFS= read -r -d '' file; do
+      [[ "$file" == "$KEEP" ]] && continue
+
+      if [[ "$file" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]] &&
+         [[ "${BASH_REMATCH[1]}" == "$ID" ]]; then
+
+        FILE_TIME=$(stat -c '%y' "$file")
+        FILE_SIZE=$(stat -c '%s' "$file")
+
+        echo "DELETE (newer):"
+        echo "  $(basename "$file")"
+        echo "  Date: $FILE_TIME"
+        echo "  Size: $FILE_SIZE bytes"
+
+        if [ "$DELETE_DUPLICATES" = true ]; then
+          rm -f -- "$file"
+          echo "  >>> DELETED"
+          REMOVED=$((REMOVED + 1))
+        else
+          echo "  >>> DRY RUN — NOT DELETED"
+        fi
+      fi
+    done < <(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mp3' -print0)
+  done
+
+  echo ""
+  echo "Duplicate files found: $TOTAL"
+
+  if [ "$DELETE_DUPLICATES" = true ]; then
+    echo "Duplicate files deleted: $REMOVED"
+  else
+    echo "DRY RUN ONLY — no duplicate files were deleted."
+    echo "Run again with --delete to remove the newer copies."
+  fi
+
+  echo "===================================="
+  echo ""
 }
 
 cleanup() {
@@ -65,6 +155,11 @@ while [[ $# -gt 0 ]]; do
       fi
 
       MODE="video"
+      shift
+      ;;
+
+    -d|--delete)
+      DELETE_DUPLICATES=true
       shift
       ;;
 
@@ -154,6 +249,16 @@ touch "$ARCHIVE_FILE"
 echo "Mode: $MODE"
 echo "URL: $PLAYLIST_URL"
 echo "Archive: $ARCHIVE_FILE"
+
+# ============================================================
+# Check/remove duplicate MP3 files
+#
+# By default this is a DRY RUN.
+# --delete removes only newer duplicates and keeps the oldest
+# file for each YouTube ID.
+# ============================================================
+
+cleanup_duplicates
 
 # ============================================================
 # Get video IDs
@@ -306,13 +411,6 @@ while IFS= read -r ID; do
     echo "No existing file."
 
   fi
-
-  # ==========================================================
-  # Remove ID from archive before attempting download
-  # ==========================================================
-
-  grep -vxF "$ID" "$ARCHIVE_FILE" > "$ARCHIVE_FILE.tmp" || true
-  mv "$ARCHIVE_FILE.tmp" "$ARCHIVE_FILE"
 
   # ==========================================================
   # Download
