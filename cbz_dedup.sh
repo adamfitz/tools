@@ -3,26 +3,54 @@
 #
 # cbz_dedup.sh
 #
-# Find duplicate CBZ chapters within each directory.
+# Find duplicate CBZ chapter files ONLY when a corresponding
+# canonical chNNN[.PART].cbz file already exists in the SAME
+# directory.
 #
-# Canonical keeper:
-#   ch000.cbz
+# Examples:
+#
 #   ch001.cbz
-#   ch123.cbz
+#   Vol.01 Ch.0001 (en).cbz
 #
-# Canonical files are NEVER reported as duplicates.
+#   -> Vol.01 Ch.0001 (en).cbz is a duplicate
 #
-# Examples of non-canonical filenames:
-#   Vol.01 Ch.0001 (en) [Reaper_Scans].cbz
-#   Vol.01 Ch.0001 - Chapter 1.cbz
-#   chapter001.cbz
-#   chapter1.cbz
-#   ch01.cbz
-#   Ch.001 (en).cbz
+# Part chapters are supported:
 #
-# Duplicate checking is performed separately in each directory.
+#   ch029.cbz
+#   Ch.0029.cbz
 #
-# NO files are deleted or modified.
+#   ch029.1.cbz
+#   Ch.0029.1.cbz
+#
+#   ch029.10.cbz
+#   Ch.0029.10.cbz
+#
+# Part numbers are part of the chapter identity.
+#
+# Therefore:
+#
+#   29
+#   29.1
+#   29.10
+#   29.11
+#
+# are FOUR different chapter identifiers.
+#
+# IMPORTANT:
+#
+# If ch029.cbz does NOT exist:
+#
+#   Ch.0029
+#   Ch.0029.1
+#   Ch.0029.10
+#   Ch.0029.11
+#
+# are ALL ignored.
+#
+# Likewise, if ch029.10.cbz does NOT exist,
+# Ch.0029.10 is ignored.
+#
+# No files are deleted or modified.
 # This script is always dry-run/report-only.
 #
 
@@ -102,7 +130,7 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         -n|--dry-run)
-            # Always dry-run. Accepted for compatibility.
+            # Always report-only.
             shift
             ;;
 
@@ -161,28 +189,97 @@ ROOT_DIR="$(cd "$ROOT_DIR" && pwd)"
 # ============================================================
 
 if [[ -n "$REPORT_FILE" ]]; then
+
     : > "$REPORT_FILE" || {
         echo "Error: cannot write report: $REPORT_FILE" >&2
         exit 1
     }
+
 fi
 
 # ============================================================
-# Output function
-#
-# In duplicates-only mode this is still just one line.
+# Output
 # ============================================================
 
 output() {
+
     printf '%s\n' "$1"
 
     if [[ -n "$REPORT_FILE" ]]; then
         printf '%s\n' "$1" >> "$REPORT_FILE"
     fi
+
 }
 
 # ============================================================
-# Extract chapter number
+# Normalize chapter identifier
+#
+# Input examples:
+#
+#   0001
+#   0029
+#   0029.1
+#   0029.10
+#   0001.05
+#
+# Output:
+#
+#   1
+#   29
+#   29.1
+#   29.10
+#   1.5
+#
+# This means:
+#
+#   ch029.10
+#   Ch.0029.10
+#
+# refer to the same chapter.
+# ============================================================
+
+normalize_chapter() {
+
+    local chapter="$1"
+    local main
+    local part
+
+    if [[ "$chapter" == *.* ]]; then
+
+        main="${chapter%%.*}"
+        part="${chapter#*.}"
+
+    else
+
+        main="$chapter"
+        part=""
+
+    fi
+
+    # Remove leading zeroes from main chapter.
+    main="${main#"${main%%[!0]*}"}"
+
+    [[ -n "$main" ]] || main="0"
+
+    if [[ -n "$part" ]]; then
+
+        # Remove leading zeroes from part.
+        part="${part#"${part%%[!0]*}"}"
+
+        [[ -n "$part" ]] || part="0"
+
+        printf '%s.%s\n' "$main" "$part"
+
+    else
+
+        printf '%s\n' "$main"
+
+    fi
+
+}
+
+# ============================================================
+# Extract complete chapter identifier from a filename.
 #
 # Recognises:
 #
@@ -196,7 +293,27 @@ output() {
 #   chapter001
 #   chatper001
 #
-# anywhere in the filename.
+# And part chapters:
+#
+#   Ch.001.1
+#   Ch.001.5
+#   Ch.001.10
+#   Chapter 29.1
+#   Chapter 29.10
+#
+# The complete numeric identifier is extracted.
+#
+# Examples:
+#
+#   Ch.0029.cbz
+#       -> 29
+#
+#   Ch.0029.10 - Something.cbz
+#       -> 29.10
+#
+#   Ch.0029.10.cbz
+#       -> 29.10
+#
 # ============================================================
 
 extract_chapter() {
@@ -204,29 +321,52 @@ extract_chapter() {
     local filename="$1"
     local base
     local chapter
+    local main
+    local part
 
     base="${filename##*/}"
 
-    # Remove extension.
+    # Remove .cbz extension.
     base="${base%.[cC][bB][zZ]}"
 
     # Lowercase.
     base="${base,,}"
 
-    if [[ "$base" =~ (^|[^a-z])(chapter|chatper|ch)[[:space:]_.-]*([0-9]+) ]]; then
+    #
+    # IMPORTANT:
+    #
+    # The optional .PART is included in the match.
+    #
+    # The character after the chapter identifier must NOT
+    # be another digit or another dot.
+    #
+    if [[ "$base" =~ (^|[^a-z])(chapter|chatper|ch)[[:space:]_.-]*([0-9]+)(\.([0-9]+))?([^0-9.]|$) ]]; then
 
-        chapter="${BASH_REMATCH[3]}"
+        main="${BASH_REMATCH[3]}"
+        part="${BASH_REMATCH[5]:-}"
 
-        # Remove leading zeroes.
-        chapter="${chapter#"${chapter%%[!0]*}"}"
+        # Normalize main number.
+        main="${main#"${main%%[!0]*}"}"
 
-        # If number was all zeroes.
-        if [[ -z "$chapter" ]]; then
-            chapter="0"
+        [[ -n "$main" ]] || main="0"
+
+        if [[ -n "$part" ]]; then
+
+            part="${part#"${part%%[!0]*}"}"
+
+            [[ -n "$part" ]] || part="0"
+
+            chapter="${main}.${part}"
+
+        else
+
+            chapter="$main"
+
         fi
 
         printf '%s\n' "$chapter"
         return 0
+
     fi
 
     return 1
@@ -235,19 +375,50 @@ extract_chapter() {
 # ============================================================
 # Is canonical?
 #
-# ONLY exactly:
+# Canonical files are:
 #
 #   ch000.cbz
 #   ch001.cbz
-#   ch123.cbz
+#   ch029.cbz
 #
-# qualifies.
+# And part chapters:
+#
+#   ch029.1.cbz
+#   ch029.5.cbz
+#   ch029.10.cbz
+#
+# Exactly three digits are required for the main chapter.
+# The optional part may contain any number of digits.
 # ============================================================
 
 is_canonical() {
+
     local filename="$1"
 
-    [[ "$filename" =~ ^ch[0-9]{3}\.cbz$ ]]
+    [[ "$filename" =~ ^ch[0-9]{3}(\.[0-9]+)?\.cbz$ ]]
+
+}
+
+# ============================================================
+# Extract canonical chapter identifier.
+#
+# ch029.cbz
+#     -> 29
+#
+# ch029.10.cbz
+#     -> 29.10
+# ============================================================
+
+canonical_chapter() {
+
+    local filename="$1"
+    local chapter
+
+    chapter="${filename#ch}"
+    chapter="${chapter%.cbz}"
+
+    normalize_chapter "$chapter"
+
 }
 
 # ============================================================
@@ -278,46 +449,106 @@ mapfile -d '' DIRECTORIES < <(
 )
 
 # ============================================================
-# ============================================================
-#
 # DUPLICATES ONLY
 #
-# THIS IS THE IMPORTANT PART.
+# The algorithm is:
 #
-# Output is STRICTLY:
+#   1. Find canonical chNNN[.PART].cbz files.
 #
-# /full/path/file1.cbz
-# /full/path/file2.cbz
-# /full/path/file3.cbz
+#   2. If there are none:
+#          DO NOTHING.
 #
-# Nothing else.
+#   3. Build a list of canonical chapter identifiers.
 #
-# ============================================================
+#   4. Examine alternate filenames.
+#
+#   5. Only output an alternate when its COMPLETE chapter
+#      identifier exists in the canonical list.
+#
 # ============================================================
 
 if (( DUPLICATES_ONLY )); then
 
     for DIR in "${DIRECTORIES[@]}"; do
 
-        CHAPTER_FILE="$TMP_DIR/chapters"
+        CANONICAL_FILE="$TMP_DIR/canonical"
 
-        : > "$CHAPTER_FILE"
+        : > "$CANONICAL_FILE"
 
         # ----------------------------------------------------
-        # Read CBZ files directly in this directory.
+        # Find canonical files in THIS directory only.
         # ----------------------------------------------------
 
         while IFS= read -r -d '' FILE; do
 
             BASENAME="${FILE##*/}"
 
-            if CHAPTER="$(extract_chapter "$BASENAME")"; then
+            if is_canonical "$BASENAME"; then
 
-                printf '%s\t%s\t%s\n' \
+                CHAPTER="$(canonical_chapter "$BASENAME")"
+
+                printf '%s\t%s\n' \
                     "$CHAPTER" \
                     "$BASENAME" \
-                    "$FILE" \
-                    >> "$CHAPTER_FILE"
+                    >> "$CANONICAL_FILE"
+
+            fi
+
+        done < <(
+            find "$DIR" \
+                -maxdepth 1 \
+                -type f \
+                -name 'ch[0-9][0-9][0-9]*.cbz' \
+                -print0 |
+            sort -z
+        )
+
+        # ----------------------------------------------------
+        # NO canonical files in this directory.
+        #
+        # This is the critical condition.
+        #
+        # Nothing in this directory can be a duplicate.
+        # ----------------------------------------------------
+
+        [[ -s "$CANONICAL_FILE" ]] || continue
+
+        # ----------------------------------------------------
+        # Examine every non-canonical CBZ in this directory.
+        # ----------------------------------------------------
+
+        while IFS= read -r -d '' FILE; do
+
+            BASENAME="${FILE##*/}"
+
+            # Canonical files are never duplicates.
+            if is_canonical "$BASENAME"; then
+                continue
+            fi
+
+            # Extract COMPLETE chapter identifier.
+            if ! CHAPTER="$(extract_chapter "$BASENAME")"; then
+                continue
+            fi
+
+            # ------------------------------------------------
+            # ONLY report if the exact chapter identifier has
+            # an existing canonical file.
+            #
+            # Examples:
+            #
+            # 29       requires ch029.cbz
+            # 29.1     requires ch029.1.cbz
+            # 29.10    requires ch029.10.cbz
+            # ------------------------------------------------
+
+            if awk -F '\t' \
+                -v chapter="$CHAPTER" \
+                '$1 == chapter { found=1; exit } END { exit !found }' \
+                "$CANONICAL_FILE"
+            then
+
+                output "$FILE"
 
             fi
 
@@ -326,64 +557,8 @@ if (( DUPLICATES_ONLY )); then
                 -maxdepth 1 \
                 -type f \
                 -iname '*.cbz' \
-                -print0
-        )
-
-        [[ -s "$CHAPTER_FILE" ]] || continue
-
-        # ----------------------------------------------------
-        # Determine which chapter numbers occur more than once.
-        # ----------------------------------------------------
-
-        while IFS= read -r CHAPTER; do
-
-            [[ -n "$CHAPTER" ]] || continue
-
-            COUNT="$(
-                awk -F '\t' \
-                    -v chapter="$CHAPTER" \
-                    '$1 == chapter { n++ } END { print n+0 }' \
-                    "$CHAPTER_FILE"
-            )"
-
-            # Only one file = not a duplicate.
-            (( COUNT > 1 )) || continue
-
-            # ------------------------------------------------
-            # Determine canonical filename.
-            # ------------------------------------------------
-
-            printf -v PADDED '%03d' "$CHAPTER"
-
-            CANONICAL="ch${PADDED}.cbz"
-
-            # ------------------------------------------------
-            # OUTPUT ONLY NON-CANONICAL FILES.
-            #
-            # No labels.
-            # No formatting.
-            # No headers.
-            # No keeper.
-            # No chapter.
-            # ------------------------------------------------
-
-            while IFS=$'\t' read -r C BASENAME FULLPATH; do
-
-                [[ "$C" == "$CHAPTER" ]] || continue
-
-                # NEVER output canonical keeper.
-                if [[ "$BASENAME" == "$CANONICAL" ]]; then
-                    continue
-                fi
-
-                output "$FULLPATH"
-
-            done < "$CHAPTER_FILE"
-
-        done < <(
-            cut -f1 "$CHAPTER_FILE" |
-            sort -n |
-            uniq
+                -print0 |
+            sort -z
         )
 
     done
@@ -402,11 +577,22 @@ output ""
 output "Root directory : $ROOT_DIR"
 output "Mode           : DRY RUN / REPORT ONLY"
 output ""
-output "Canonical keeper format:"
+output "Canonical format:"
 output "  chNNN.cbz"
+output "  chNNN.PART.cbz"
 output ""
+output "A file is only considered a duplicate when the corresponding"
+output "canonical file already exists in the SAME directory."
+output ""
+output "Part chapters are treated as separate chapter identifiers."
+output ""
+output "Examples:"
+output "  ch029.cbz       = chapter 29"
+output "  ch029.1.cbz     = chapter 29.1"
+output "  ch029.10.cbz    = chapter 29.10"
+output ""
+output "No cross-directory duplicate detection is performed."
 output "Canonical files are NEVER marked as duplicates."
-output "Duplicate checking is performed separately in each directory."
 output ""
 output "============================================================"
 
@@ -419,47 +605,15 @@ TOTAL_DIRECTORIES=0
 
 for DIR in "${DIRECTORIES[@]}"; do
 
-    CHAPTER_FILE="$TMP_DIR/chapters"
-
-    : > "$CHAPTER_FILE"
-
     ((TOTAL_DIRECTORIES++))
 
+    CANONICAL_FILE="$TMP_DIR/canonical"
+
+    : > "$CANONICAL_FILE"
+
     # --------------------------------------------------------
-    # Collect files
+    # Find canonical files in THIS directory.
     # --------------------------------------------------------
-
-    while IFS= read -r -d '' FILE; do
-
-        BASENAME="${FILE##*/}"
-
-        if CHAPTER="$(extract_chapter "$BASENAME")"; then
-
-            printf '%s\t%s\t%s\n' \
-                "$CHAPTER" \
-                "$BASENAME" \
-                "$FILE" \
-                >> "$CHAPTER_FILE"
-
-        fi
-
-    done < <(
-        find "$DIR" \
-            -maxdepth 1 \
-            -type f \
-            -iname '*.cbz' \
-            -print0 |
-        sort -z
-    )
-
-    [[ -s "$CHAPTER_FILE" ]] || continue
-
-    output ""
-    output "DIRECTORY:"
-    output "  $DIR"
-    output ""
-
-    output "  CBZ files:"
 
     while IFS= read -r -d '' FILE; do
 
@@ -467,17 +621,102 @@ for DIR in "${DIRECTORIES[@]}"; do
 
         if is_canonical "$BASENAME"; then
 
-            output "    [KEEP]        $BASENAME"
+            CHAPTER="$(canonical_chapter "$BASENAME")"
 
-        elif extract_chapter "$BASENAME" >/dev/null 2>&1; then
-
-            output "    [CHECK]       $BASENAME"
-
-        else
-
-            output "    [NO CHAPTER]  $BASENAME"
+            printf '%s\t%s\t%s\n' \
+                "$CHAPTER" \
+                "$BASENAME" \
+                "$FILE" \
+                >> "$CANONICAL_FILE"
 
         fi
+
+    done < <(
+        find "$DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name 'ch[0-9][0-9][0-9]*.cbz' \
+            -print0 |
+        sort -z
+    )
+
+    # --------------------------------------------------------
+    # No canonical files = no duplicate checking.
+    # --------------------------------------------------------
+
+    [[ -s "$CANONICAL_FILE" ]] || continue
+
+    # --------------------------------------------------------
+    # Directory header.
+    # --------------------------------------------------------
+
+    output ""
+    output "DIRECTORY:"
+    output "  $DIR"
+    output ""
+
+    output "  Canonical files:"
+
+    while IFS=$'\t' read -r CHAPTER BASENAME FULLPATH; do
+
+        output "    [KEEP] $BASENAME"
+
+    done < "$CANONICAL_FILE"
+
+    # --------------------------------------------------------
+    # Check every CBZ against the canonical chapter list.
+    # --------------------------------------------------------
+
+    while IFS= read -r -d '' FILE; do
+
+        BASENAME="${FILE##*/}"
+
+        # Never report canonical files.
+        if is_canonical "$BASENAME"; then
+            continue
+        fi
+
+        # Ignore files without a recognizable chapter.
+        if ! CHAPTER="$(extract_chapter "$BASENAME")"; then
+            continue
+        fi
+
+        # ----------------------------------------------------
+        # Find the corresponding canonical file.
+        # ----------------------------------------------------
+
+        KEEPER="$(
+            awk -F '\t' \
+                -v chapter="$CHAPTER" \
+                '$1 == chapter {
+                    print $2
+                    exit
+                }' \
+                "$CANONICAL_FILE"
+        )"
+
+        # No canonical keeper for this chapter.
+        #
+        # Therefore this file is NOT a duplicate.
+        [[ -n "$KEEPER" ]] || continue
+
+        # ----------------------------------------------------
+        # Duplicate found.
+        # ----------------------------------------------------
+
+        output ""
+
+        output "------------------------------------------------------------"
+        output "DUPLICATE FOUND"
+        output "DIRECTORY: $DIR"
+        output "------------------------------------------------------------"
+        output ""
+        output "  Chapter: $CHAPTER"
+        output "  Keeper:  $KEEPER"
+        output "  Duplicate:"
+        output "    [DUPLICATE] $BASENAME"
+
+        ((TOTAL_DUPLICATES++))
 
     done < <(
         find "$DIR" \
@@ -486,55 +725,6 @@ for DIR in "${DIRECTORIES[@]}"; do
             -iname '*.cbz' \
             -print0 |
         sort -z
-    )
-
-    # --------------------------------------------------------
-    # Find duplicate chapters
-    # --------------------------------------------------------
-
-    while IFS= read -r CHAPTER; do
-
-        COUNT="$(
-            awk -F '\t' \
-                -v chapter="$CHAPTER" \
-                '$1 == chapter { n++ } END { print n+0 }' \
-                "$CHAPTER_FILE"
-        )"
-
-        (( COUNT > 1 )) || continue
-
-        printf -v PADDED '%03d' "$CHAPTER"
-
-        CANONICAL="ch${PADDED}.cbz"
-
-        output ""
-        output "------------------------------------------------------------"
-        output "DUPLICATES FOUND"
-        output "DIRECTORY: $DIR"
-        output "------------------------------------------------------------"
-        output ""
-        output "  Chapter $CHAPTER"
-        output "  Keeper: $CANONICAL"
-        output "  Duplicate files:"
-
-        while IFS=$'\t' read -r C BASENAME FULLPATH; do
-
-            [[ "$C" == "$CHAPTER" ]] || continue
-
-            if [[ "$BASENAME" == "$CANONICAL" ]]; then
-                continue
-            fi
-
-            output "    [DUPLICATE] $BASENAME"
-
-            ((TOTAL_DUPLICATES++))
-
-        done < "$CHAPTER_FILE"
-
-    done < <(
-        cut -f1 "$CHAPTER_FILE" |
-        sort -n |
-        uniq
     )
 
 done
@@ -550,6 +740,9 @@ output "============================================================"
 output ""
 output "Directories scanned : $TOTAL_DIRECTORIES"
 output "Duplicate files     : $TOTAL_DUPLICATES"
+output ""
+output "Only files with an existing canonical chNNN[.PART].cbz"
+output "were checked."
 output ""
 output "No files were deleted."
 output "No files were modified."
