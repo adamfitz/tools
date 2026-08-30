@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 
 set -u
@@ -13,12 +12,12 @@ DELETE_DUPLICATES=false
 CURRENT_PGID=""
 
 usage() {
-  echo "Usage: $0 [OPTIONS] [<playlist_or_video_url>]"
+  echo "Usage: $0 [OPTIONS] <playlist_or_video_url>"
   echo ""
   echo "Options:"
   echo "  -a, --audio    Download audio only as MP3"
   echo "  -v, --video    Download video with audio"
-  echo "  -d, --delete   Delete newer duplicate files, keeping the oldest copy"
+  echo "  -d, --delete   Delete duplicate MP3 files, keeping the oldest copy"
   echo "  -h, --help     Show this help"
   echo ""
   echo "Examples:"
@@ -26,98 +25,131 @@ usage() {
   echo "  $0 --video \"https://www.youtube.com/playlist?list=XXXX\""
   echo "  $0 --audio \"https://www.youtube.com/watch?v=XXXX\""
   echo "  $0 --video \"https://www.youtube.com/watch?v=XXXX\""
-  echo "  $0 --delete"
   echo "  $0 --delete \"https://www.youtube.com/playlist?list=XXXX\""
-  echo "  $0 --audio --delete \"https://www.youtube.com/playlist?list=XXXX\""
-  echo "  $0 --video --delete \"https://www.youtube.com/playlist?list=XXXX\""
+  echo "  $0 --delete \"https://www.youtube.com/watch?v=XXXX\""
 }
 
 # ============================================================
-# Determine media type from filename extension.
+# Return true if a filename belongs to a specific YouTube ID.
 #
-# Audio and video are deliberately deduplicated separately.
+# IMPORTANT:
+# Do NOT use:
 #
-# Example:
+#   find ... -name "*[$ID].*"
 #
-#   title [ABC123xyz01].mp3  -> audio
-#   title [ABC123xyz01].m4a  -> audio
-#   title [ABC123xyz01].mp4  -> video
-#   title [ABC123xyz01].mkv  -> video
+# because [] is a glob character class.
 #
-# MP3 and MP4 with the same YouTube ID are NOT duplicates.
+# We instead extract the ID from the literal:
+#
+#   [VIDEO_ID].extension
+#
 # ============================================================
 
-get_media_type() {
+is_matching_audio_file() {
   local file="$1"
-  local ext
+  local id="$2"
+  local base
 
-  ext="${file##*.}"
-  ext="${ext,,}"
+  base=$(basename "$file")
 
-  case "$ext" in
-    mp3|m4a|aac|opus|ogg|oga|wav|flac|alac|wma)
-      echo "audio"
-      ;;
+  [[ "$base" =~ \[${id}\]\.mp3$ ]]
+}
 
-    mp4|mkv|webm|avi|mov|m4v|wmv|flv|ts|m2ts|mts|3gp)
-      echo "video"
-      ;;
+is_matching_video_file() {
+  local file="$1"
+  local id="$2"
+  local base
 
-    *)
-      echo "unknown"
-      ;;
-  esac
+  base=$(basename "$file")
+
+  [[ "$base" =~ \[${id}\]\.(mp4|webm|mkv)$ ]]
 }
 
 # ============================================================
-# Extract a YouTube ID from the end of a filename.
+# Find an existing MP3 for an exact YouTube ID.
 #
-# Expected:
-#
-#   Anything [ABC123xyz01].mp3
-#   Anything [ABC123xyz01].mp4
-#
-# YouTube IDs are exactly 11 characters and contain:
-#
-#   A-Z
-#   a-z
-#   0-9
-#   -
-#   _
+# The ID MUST be inside literal square brackets immediately
+# before .mp3.
 # ============================================================
 
-get_youtube_id() {
+find_audio_file() {
+  local id="$1"
   local file
-  file="$(basename "$1")"
 
-  if [[ "$file" =~ \[([A-Za-z0-9_-]{11})\]\.[^.]+$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
-    return 0
-  fi
+  while IFS= read -r -d '' file; do
+    if is_matching_audio_file "$file" "$id"; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done < <(
+    find "$OUTPUT_DIR" \
+      -maxdepth 1 \
+      -type f \
+      -name '*.mp3' \
+      -print0
+  )
 
   return 1
 }
 
 # ============================================================
-# Duplicate cleanup
+# Find an existing video for an exact YouTube ID.
 #
-# Audio is deduplicated independently from video.
+# Supported containers:
+#   .mp4
+#   .webm
+#   .mkv
 #
-# Same ID + same media type:
+# The ID MUST be inside literal square brackets immediately
+# before the extension.
+# ============================================================
+
+find_video_file() {
+  local id="$1"
+  local file
+
+  while IFS= read -r -d '' file; do
+    if is_matching_video_file "$file" "$id"; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done < <(
+    find "$OUTPUT_DIR" \
+      -maxdepth 1 \
+      -type f \
+      \( \
+        -name '*.mp4' \
+        -o -name '*.webm' \
+        -o -name '*.mkv' \
+      \) \
+      -print0
+  )
+
+  return 1
+}
+
+# ============================================================
+# Cleanup duplicate MP3 files
 #
-#   oldest = KEEP
-#   newer  = DELETE
+# Files are duplicates when they contain the same exact
+# 11-character YouTube ID in:
 #
-# Same ID + different media type:
+#   [VIDEO_ID].mp3
 #
-#   MP3 and MP4 are BOTH KEPT
+# The oldest file is kept.
+#
+# --delete:
+#   Delete newer duplicates.
+#
+# Without --delete:
+#   DRY RUN ONLY.
+#
 # ============================================================
 
 cleanup_duplicates() {
   echo ""
   echo "===================================="
-  echo "Checking for duplicate audio/video files"
-  echo "Directory: $OUTPUT_DIR"
+  echo "Checking for duplicate MP3 files"
   echo "===================================="
 
   declare -A oldest_file
@@ -126,49 +158,35 @@ cleanup_duplicates() {
 
   local file
   local id
-  local media_type
-  local key
   local mtime
 
   while IFS= read -r -d '' file; do
 
-    id=""
-
-    if ! id="$(get_youtube_id "$file")"; then
+    # Extract exact 11-character YouTube ID from:
+    #
+    #   anything [VIDEO_ID].mp3
+    #
+    if [[ "$(basename "$file")" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]]; then
+      id="${BASH_REMATCH[1]}"
+    else
       continue
     fi
 
-    media_type="$(get_media_type "$file")"
+    mtime=$(stat -c '%Y' -- "$file")
 
-    if [[ "$media_type" == "unknown" ]]; then
-      continue
-    fi
+    if [[ -z "${oldest_file[$id]+x}" ]]; then
 
-    # Separate namespace for audio/video.
-    #
-    # This means:
-    #
-    #   audio:ABC123xyz01
-    #   video:ABC123xyz01
-    #
-    # are completely independent.
-    key="${media_type}:${id}"
-
-    mtime="$(stat -c '%Y' -- "$file")"
-
-    if [[ -z "${oldest_file[$key]+x}" ]]; then
-
-      oldest_file["$key"]="$file"
-      oldest_time["$key"]="$mtime"
-      duplicate_count["$key"]=1
+      oldest_file["$id"]="$file"
+      oldest_time["$id"]="$mtime"
+      duplicate_count["$id"]=1
 
     else
 
-      duplicate_count["$key"]=$((duplicate_count["$key"] + 1))
+      duplicate_count["$id"]=$((duplicate_count["$id"] + 1))
 
-      if (( mtime < oldest_time["$key"] )); then
-        oldest_file["$key"]="$file"
-        oldest_time["$key"]="$mtime"
+      if (( mtime < oldest_time["$id"] )); then
+        oldest_file["$id"]="$file"
+        oldest_time["$id"]="$mtime"
       fi
 
     fi
@@ -177,41 +195,30 @@ cleanup_duplicates() {
     find "$OUTPUT_DIR" \
       -maxdepth 1 \
       -type f \
+      -name '*.mp3' \
       -print0
   )
 
-  local total_duplicates=0
-  local total_deleted=0
-
+  local total=0
+  local removed=0
   local count
   local keep
   local file_time
   local file_size
-  local label
 
-  for key in "${!duplicate_count[@]}"; do
+  for id in "${!duplicate_count[@]}"; do
 
-    count="${duplicate_count[$key]}"
+    count="${duplicate_count[$id]}"
 
+    # Not a duplicate.
     (( count > 1 )) || continue
 
-    total_duplicates=$((total_duplicates + count - 1))
-
-    keep="${oldest_file[$key]}"
-
-    if [[ "$key" == audio:* ]]; then
-      label="AUDIO"
-    else
-      label="VIDEO"
-    fi
-
-    id="${key#*:}"
+    total=$((total + count - 1))
+    keep="${oldest_file[$id]}"
 
     echo ""
-    echo "------------------------------------"
-    echo "$label duplicate: $id"
-    echo "------------------------------------"
-
+    echo "YouTube ID: $id"
+    echo ""
     echo "KEEP (oldest):"
     echo "  $(basename "$keep")"
     echo "  Date: $(stat -c '%y' -- "$keep")"
@@ -221,50 +228,34 @@ cleanup_duplicates() {
 
       [[ "$file" == "$keep" ]] && continue
 
-      local other_id
-      local other_type
+      if [[ "$(basename "$file")" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]] &&
+         [[ "${BASH_REMATCH[1]}" == "$id" ]]; then
 
-      other_id=""
+        file_time=$(stat -c '%y' -- "$file")
+        file_size=$(stat -c '%s' -- "$file")
 
-      if ! other_id="$(get_youtube_id "$file")"; then
-        continue
-      fi
+        echo ""
+        echo "DELETE (newer):"
+        echo "  $(basename "$file")"
+        echo "  Date: $file_time"
+        echo "  Size: $file_size bytes"
 
-      [[ "$other_id" == "$id" ]] || continue
+        if [[ "$DELETE_DUPLICATES" == true ]]; then
 
-      other_type="$(get_media_type "$file")"
-
-      [[ "$other_type" == "$media_type" ]] || continue
-
-      file_time="$(stat -c '%y' -- "$file")"
-      file_size="$(stat -c '%s' -- "$file")"
-
-      echo ""
-      echo "DELETE (newer):"
-      echo "  $(basename "$file")"
-      echo "  Date: $file_time"
-      echo "  Size: $file_size bytes"
-
-      if [[ "$DELETE_DUPLICATES" == true ]]; then
-
-        if rm -f -- "$file"; then
+          rm -f -- "$file"
 
           if [[ ! -e "$file" ]]; then
             echo "  >>> DELETED"
-            total_deleted=$((total_deleted + 1))
+            removed=$((removed + 1))
           else
-            echo "  >>> ERROR: file still exists"
+            echo "  >>> ERROR: could not delete file"
           fi
 
         else
 
-          echo "  >>> ERROR: failed to delete"
+          echo "  >>> DRY RUN — NOT DELETED"
 
         fi
-
-      else
-
-        echo "  >>> DRY RUN — NOT DELETED"
 
       fi
 
@@ -272,6 +263,7 @@ cleanup_duplicates() {
       find "$OUTPUT_DIR" \
         -maxdepth 1 \
         -type f \
+        -name '*.mp3' \
         -print0
     )
 
@@ -279,14 +271,12 @@ cleanup_duplicates() {
 
   echo ""
   echo "===================================="
-  echo "Duplicate scan complete"
-  echo "===================================="
-  echo "Duplicate files found: $total_duplicates"
+  echo "Duplicate files found: $total"
 
   if [[ "$DELETE_DUPLICATES" == true ]]; then
-    echo "Duplicate files deleted: $total_deleted"
+    echo "Duplicate files deleted: $removed"
   else
-    echo "DRY RUN ONLY — no files were deleted."
+    echo "DRY RUN ONLY — no duplicate files were deleted."
   fi
 
   echo "===================================="
@@ -294,7 +284,7 @@ cleanup_duplicates() {
 }
 
 # ============================================================
-# Cleanup interrupted yt-dlp
+# Cleanup interrupted yt-dlp process
 # ============================================================
 
 cleanup() {
@@ -387,17 +377,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ============================================================
-# Validate mode
+# Validate arguments
 # ============================================================
 
-# --delete by itself is a valid standalone operation.
+if [[ -z "$PLAYLIST_URL" ]]; then
+  echo "Error: playlist or video URL is required."
+  usage
+  exit 1
+fi
+
+# --delete by itself is valid.
 #
-#   yt_dl.sh --delete
+#   yt_dl.sh --delete URL
 #
-# No URL is needed.
+# performs duplicate cleanup and exits.
 #
-# --audio and --video still require a URL.
-# ============================================================
+# If combined with --audio or --video:
+#
+#   yt_dl.sh --delete --audio URL
+#   yt_dl.sh --delete --video URL
+#
+# it cleans duplicates first, then downloads.
 
 if [[ -z "$MODE" ]]; then
 
@@ -413,35 +413,13 @@ fi
 
 # ============================================================
 # DELETE-ONLY MODE
-#
-# No network access.
-# No URL.
-# No yt-dlp.
-# No cookies.
-# No ffmpeg.
-# No ffprobe.
 # ============================================================
 
 if [[ "$MODE" == "delete" ]]; then
 
-  if [[ $# -gt 0 ]]; then
-    :
-  fi
-
   cleanup_duplicates
 
   exit 0
-fi
-
-# ============================================================
-# Audio/video modes require URL
-# ============================================================
-
-if [[ -z "$PLAYLIST_URL" ]]; then
-
-  echo "Error: playlist or video URL is required for --audio/--video."
-  usage
-  exit 1
 
 fi
 
@@ -486,46 +464,54 @@ echo "URL: $PLAYLIST_URL"
 echo "Archive: $ARCHIVE_FILE"
 
 # ============================================================
-# Optional duplicate cleanup before downloading.
+# Clean duplicates BEFORE downloading.
+#
+# Without --delete:
+#   DRY RUN.
+#
+# With --delete:
+#   Actually deletes newer duplicate MP3s.
 # ============================================================
 
 cleanup_duplicates
 
 # ============================================================
-# Fetch IDs
+# Get video IDs
 #
-# Works with both:
+# --flat-playlist works for:
 #
 #   single video
 #   playlist
+#
 # ============================================================
 
 echo "Fetching video IDs..."
 
-IDS=$(
-  yt-dlp \
-    --cookies "$COOKIES_FILE" \
-    --flat-playlist \
-    --print "%(id)s" \
-    --skip-download \
-    "$PLAYLIST_URL"
-)
+IDS=$(yt-dlp \
+  --cookies "$COOKIES_FILE" \
+  --flat-playlist \
+  --print "%(id)s" \
+  --skip-download \
+  "$PLAYLIST_URL" 2>&1)
 
 FETCH_STATUS=$?
 
 if [[ "$FETCH_STATUS" -ne 0 ]]; then
+  echo "$IDS"
   echo "Failed to fetch video/playlist."
   exit 1
 fi
 
-IDS="$(printf '%s\n' "$IDS" | sed '/^[[:space:]]*$/d')"
+# Remove blank lines.
+
+IDS=$(printf '%s\n' "$IDS" | sed '/^[[:space:]]*$/d')
 
 if [[ -z "$IDS" ]]; then
   echo "No videos found."
   exit 1
 fi
 
-VIDEO_COUNT="$(printf '%s\n' "$IDS" | wc -l)"
+VIDEO_COUNT=$(printf '%s\n' "$IDS" | wc -l)
 
 echo "Videos found: $VIDEO_COUNT"
 
@@ -545,44 +531,61 @@ while IFS= read -r ID; do
   FILE=""
 
   # ==========================================================
-  # Find existing file
+  # Check archive FIRST.
   #
-  # Escape the literal [ and ] by using a character class:
-  #
-  #   *[[]ID].mp3
-  #
-  # This avoids treating [ID] as a shell/find wildcard.
+  # IMPORTANT:
+  # Even if the archive contains the ID, we verify the actual
+  # file using exact ID matching.
   # ==========================================================
 
-  if [[ "$MODE" == "audio" ]]; then
+  if grep -qxF "$ID" "$ARCHIVE_FILE"; then
 
-    FILE="$(
-      find "$OUTPUT_DIR" \
-        -maxdepth 1 \
-        -type f \
-        -name "*[[]${ID}].mp3" \
-        -print -quit
-    )"
+    echo "ID is already in archive."
 
-  else
+    if [[ "$MODE" == "audio" ]]; then
 
-    FILE="$(
-      find "$OUTPUT_DIR" \
-        -maxdepth 1 \
-        -type f \
-        \( \
-          -name "*[[]${ID}].mp4" \
-          -o -name "*[[]${ID}].mkv" \
-          -o -name "*[[]${ID}].webm" \
-          -o -name "*[[]${ID}].m4v" \
-          -o -name "*[[]${ID}].mov" \
-          -o -name "*[[]${ID}].avi" \
-          -o -name "*[[]${ID}].ts" \
-        \) \
-        ! -name "*.part" \
-        ! -name "*.ytdl" \
-        -print -quit
-    )"
+      FILE=$(find_audio_file "$ID" || true)
+
+    else
+
+      FILE=$(find_video_file "$ID" || true)
+
+    fi
+
+    # Archive says downloaded but exact file does not exist.
+    # Remove stale archive entry so it gets downloaded again.
+
+    if [[ -z "$FILE" ]]; then
+
+      echo "Archive entry exists but matching output file is missing."
+      echo "Removing stale archive entry."
+
+      sed -i "\|^${ID}$|d" "$ARCHIVE_FILE"
+
+    fi
+
+  fi
+
+  # ==========================================================
+  # Find existing output file.
+  #
+  # IMPORTANT:
+  # Exact YouTube ID matching is used.
+  #
+  # NO find -name "*[$ID].*"
+  # ==========================================================
+
+  if [[ -z "$FILE" ]]; then
+
+    if [[ "$MODE" == "audio" ]]; then
+
+      FILE=$(find_audio_file "$ID" || true)
+
+    else
+
+      FILE=$(find_video_file "$ID" || true)
+
+    fi
 
   fi
 
@@ -597,21 +600,18 @@ while IFS= read -r ID; do
 
     if [[ "$MODE" == "audio" ]]; then
 
-      AUDIO_STREAMS="$(
-        ffprobe \
-          -v error \
-          -select_streams a \
-          -show_entries stream=index \
-          -of csv=p=0 \
-          "$FILE" 2>/dev/null |
-          wc -l
-      )"
+      AUDIO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams a \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
 
       if (( AUDIO_STREAMS > 0 )); then
 
         echo "OK: valid audio file."
 
-        grep -qxF "$ID" "$ARCHIVE_FILE" ||
+        grep -qxF "$ID" "$ARCHIVE_FILE" || \
           echo "$ID" >> "$ARCHIVE_FILE"
 
         continue
@@ -620,32 +620,26 @@ while IFS= read -r ID; do
 
     else
 
-      VIDEO_STREAMS="$(
-        ffprobe \
-          -v error \
-          -select_streams v \
-          -show_entries stream=index \
-          -of csv=p=0 \
-          "$FILE" 2>/dev/null |
-          wc -l
-      )"
+      VIDEO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams v \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
 
-      AUDIO_STREAMS="$(
-        ffprobe \
-          -v error \
-          -select_streams a \
-          -show_entries stream=index \
-          -of csv=p=0 \
-          "$FILE" 2>/dev/null |
-          wc -l
-      )"
+      AUDIO_STREAMS=$(ffprobe \
+        -v error \
+        -select_streams a \
+        -show_entries stream=index \
+        -of csv=p=0 \
+        "$FILE" 2>/dev/null | wc -l)
 
       if (( VIDEO_STREAMS > 0 )) &&
          (( AUDIO_STREAMS > 0 )); then
 
         echo "OK: valid video + audio file."
 
-        grep -qxF "$ID" "$ARCHIVE_FILE" ||
+        grep -qxF "$ID" "$ARCHIVE_FILE" || \
           echo "$ID" >> "$ARCHIVE_FILE"
 
         continue
@@ -659,17 +653,19 @@ while IFS= read -r ID; do
 
     rm -f -- "$FILE"
 
+    # Remove stale archive entry.
+
     sed -i "\|^${ID}$|d" "$ARCHIVE_FILE"
 
   else
 
-    echo "No existing file."
+    echo "No existing matching file."
 
   fi
 
-  # ==========================================================
+  # ============================================================
   # Download
-  # ==========================================================
+  # ============================================================
 
   if [[ "$MODE" == "audio" ]]; then
 
@@ -710,10 +706,11 @@ while IFS= read -r ID; do
 
   PID=$!
 
-  CURRENT_PGID="$(ps -o pgid= "$PID" | tr -d ' ')"
+  # Get process group.
+
+  CURRENT_PGID=$(ps -o pgid= "$PID" | tr -d ' ')
 
   wait "$PID"
-
   DOWNLOAD_STATUS=$?
 
   CURRENT_PGID=""
@@ -726,40 +723,20 @@ while IFS= read -r ID; do
   fi
 
   # ==========================================================
-  # Find downloaded file
+  # Find downloaded file.
+  #
+  # Exact ID matching only.
   # ==========================================================
 
   FILE=""
 
   if [[ "$MODE" == "audio" ]]; then
 
-    FILE="$(
-      find "$OUTPUT_DIR" \
-        -maxdepth 1 \
-        -type f \
-        -name "*[[]${ID}].mp3" \
-        -print -quit
-    )"
+    FILE=$(find_audio_file "$ID" || true)
 
   else
 
-    FILE="$(
-      find "$OUTPUT_DIR" \
-        -maxdepth 1 \
-        -type f \
-        \( \
-          -name "*[[]${ID}].mp4" \
-          -o -name "*[[]${ID}].mkv" \
-          -o -name "*[[]${ID}].webm" \
-          -o -name "*[[]${ID}].m4v" \
-          -o -name "*[[]${ID}].mov" \
-          -o -name "*[[]${ID}].avi" \
-          -o -name "*[[]${ID}].ts" \
-        \) \
-        ! -name "*.part" \
-        ! -name "*.ytdl" \
-        -print -quit
-    )"
+    FILE=$(find_video_file "$ID" || true)
 
   fi
 
@@ -771,6 +748,7 @@ while IFS= read -r ID; do
 
     echo "ERROR: no output file generated."
     echo "Video ID: $ID"
+
     continue
 
   fi
@@ -778,21 +756,22 @@ while IFS= read -r ID; do
   echo "Downloaded:"
   echo "  $(basename "$FILE")"
 
+  # ==========================================================
+  # Validate audio
+  # ==========================================================
+
   if [[ "$MODE" == "audio" ]]; then
 
-    AUDIO_STREAMS="$(
-      ffprobe \
-        -v error \
-        -select_streams a \
-        -show_entries stream=index \
-        -of csv=p=0 \
-        "$FILE" 2>/dev/null |
-        wc -l
-    )"
+    AUDIO_STREAMS=$(ffprobe \
+      -v error \
+      -select_streams a \
+      -show_entries stream=index \
+      -of csv=p=0 \
+      "$FILE" 2>/dev/null | wc -l)
 
     if (( AUDIO_STREAMS > 0 )); then
 
-      grep -qxF "$ID" "$ARCHIVE_FILE" ||
+      grep -qxF "$ID" "$ARCHIVE_FILE" || \
         echo "$ID" >> "$ARCHIVE_FILE"
 
       echo "OK → audio validated → archived"
@@ -806,32 +785,30 @@ while IFS= read -r ID; do
 
     fi
 
+  # ==========================================================
+  # Validate video + audio
+  # ==========================================================
+
   else
 
-    VIDEO_STREAMS="$(
-      ffprobe \
-        -v error \
-        -select_streams v \
-        -show_entries stream=index \
-        -of csv=p=0 \
-        "$FILE" 2>/dev/null |
-        wc -l
-    )"
+    VIDEO_STREAMS=$(ffprobe \
+      -v error \
+      -select_streams v \
+      -show_entries stream=index \
+      -of csv=p=0 \
+      "$FILE" 2>/dev/null | wc -l)
 
-    AUDIO_STREAMS="$(
-      ffprobe \
-        -v error \
-        -select_streams a \
-        -show_entries stream=index \
-        -of csv=p=0 \
-        "$FILE" 2>/dev/null |
-        wc -l
-    )"
+    AUDIO_STREAMS=$(ffprobe \
+      -v error \
+      -select_streams a \
+      -show_entries stream=index \
+      -of csv=p=0 \
+      "$FILE" 2>/dev/null | wc -l)
 
     if (( VIDEO_STREAMS > 0 )) &&
        (( AUDIO_STREAMS > 0 )); then
 
-      grep -qxF "$ID" "$ARCHIVE_FILE" ||
+      grep -qxF "$ID" "$ARCHIVE_FILE" || \
         echo "$ID" >> "$ARCHIVE_FILE"
 
       echo "OK → video + audio validated → archived"
@@ -852,7 +829,10 @@ while IFS= read -r ID; do
 done <<< "$IDS"
 
 # ============================================================
-# Final duplicate cleanup when --delete was supplied.
+# Final duplicate cleanup
+#
+# If --delete was specified, remove duplicates created/found
+# during this run too.
 # ============================================================
 
 if [[ "$DELETE_DUPLICATES" == true ]]; then
@@ -868,4 +848,3 @@ echo ""
 echo "===================================="
 echo "Finished."
 echo "===================================="
-```
