@@ -18,11 +18,20 @@
 #   chapter 100.cbz
 #   Ch 100.cbz
 #   Ch. 100.cbz
+#   Ch.100.cbz
 #   ch1.cbz
 #   ch01.cbz
 #   ch001.cbz
 #   Chapter 72.5.cbz
 #   72.5.cbz
+#
+# Also supports chapter prefixes after volume information:
+#   Vol.01 Ch.0001.cbz
+#   Vol.01 Ch.0001 - Title.cbz
+#   Vol.02 Ch.0010.cbz
+#   Vol.02 Ch.0010.5.cbz
+#   Vol.03 Ch.0013 (en) [Group].cbz
+#   Vol.03 Chapter 0014.cbz
 #
 # Features:
 #   - Dry run by default
@@ -30,6 +39,8 @@
 #   - --dir / -d target directory
 #   - Handles leading zero numbers safely
 #   - Handles fractional chapters
+#   - Handles Ch / Ch. / Chapter prefixes anywhere in filename
+#   - Correctly ignores volume numbers when an explicit chapter number exists
 #   - Collision-safe renaming
 #   - Reads all filenames before renaming
 #   - Uses temporary staging for collisions
@@ -111,12 +122,13 @@ shopt -s nullglob
 # Function: convert chapter number to canonical filename
 #
 # Examples:
-#   1     -> ch001.cbz
-#   01    -> ch001.cbz
-#   001   -> ch001.cbz
-#   12    -> ch012.cbz
-#   100   -> ch100.cbz
-#   72.5  -> ch072.5.cbz
+#   1       -> ch001.cbz
+#   01      -> ch001.cbz
+#   001     -> ch001.cbz
+#   12      -> ch012.cbz
+#   100     -> ch100.cbz
+#   72.5    -> ch072.5.cbz
+#   0010.5  -> ch010.5.cbz
 # ==========================================================
 
 make_canonical_name() {
@@ -129,6 +141,7 @@ make_canonical_name() {
     # ------------------------------------------------------
     # Fractional chapter
     # ------------------------------------------------------
+
     if [[ "$chapter" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
         integer_part="${BASH_REMATCH[1]}"
         fractional_part="${BASH_REMATCH[2]}"
@@ -151,6 +164,7 @@ make_canonical_name() {
     # ------------------------------------------------------
     # Integer chapter
     # ------------------------------------------------------
+
     if [[ "$chapter" =~ ^[0-9]+$ ]]; then
 
         # Remove leading zeroes.
@@ -174,34 +188,26 @@ make_canonical_name() {
 # ==========================================================
 # Function: extract chapter number from filename
 #
-# Supported:
+# IMPORTANT:
+# Explicit Ch / Chapter prefixes are searched ANYWHERE
+# in the filename.
 #
-#   1.cbz
-#   01.cbz
-#   001.cbz
+# This means:
 #
-#   Chapter 1.cbz
-#   Chapter 01.cbz
-#   Chapter 001.cbz
-#   Chapter 72.5.cbz
+#   Ch.0001.cbz
+#   Chapter 0001.cbz
+#   Vol.01 Ch.0001.cbz
+#   Vol.02 Ch.0010.5.cbz
+#   Vol.03 Ch.0013 (en).cbz
 #
-#   chapter 100.cbz
+# are all recognised correctly.
 #
-#   Ch 100.cbz
-#   Ch. 100.cbz
-#   Ch.100.cbz
+# Explicit chapter prefixes are checked BEFORE a leading
+# number so that:
 #
-#   ch1.cbz
-#   ch01.cbz
-#   ch001.cbz
+#   Vol.02 Ch.0010.cbz
 #
-# Also supports chapter numbers followed by additional text:
-#
-#   Chapter 12 - Title.cbz
-#   Chapter 12 (English).cbz
-#   Ch. 12 - Something.cbz
-#   12 - Something.cbz
-#
+# gets chapter 0010, NOT volume 02.
 # ==========================================================
 
 extract_chapter() {
@@ -211,44 +217,63 @@ extract_chapter() {
     base="${filename%.cbz}"
 
     # ------------------------------------------------------
-    # 1. Canonical/explicit "ch" prefix
+    # 1. Explicit "Chapter" prefix ANYWHERE
     #
-    # ch1
-    # ch01
-    # ch001
-    # ch72.5
-    #
+    # Examples:
+    #   Chapter 1
+    #   Chapter 01
+    #   Chapter 001
+    #   Chapter 72.5
+    #   Vol.01 Chapter 0001
+    #   Volume 2 - Chapter 10
     # ------------------------------------------------------
 
-    if [[ "$base" =~ ^[Cc][Hh][[:space:]]*\.?[[:space:]]*([0-9]+([.][0-9]+)?)($|[[:space:]_.-]) ]]; then
+    if [[ "$base" =~ [Cc][Hh][Aa][Pp][Tt][Ee][Rr][[:space:]_.-]*([0-9]+([.][0-9]+)?)($|[[:space:]_.-]) ]]; then
         printf '%s' "${BASH_REMATCH[1]}"
         return 0
     fi
 
     # ------------------------------------------------------
-    # 2. "Chapter" prefix
+    # 2. Explicit "Ch" prefix ANYWHERE
     #
-    # Chapter 1
-    # Chapter 01
-    # Chapter 001
-    # Chapter 72.5
+    # Examples:
+    #   Ch 100
+    #   Ch. 100
+    #   Ch.100
+    #   ch100
+    #   Vol.01 Ch.0001
+    #   Vol.02 Ch.0010.5
+    #
+    # The character immediately before "Ch" must not be an
+    # alphabetic character. This prevents matching things
+    # like:
+    #
+    #   Character...
+    #   Chronicles...
     #
     # ------------------------------------------------------
 
-    if [[ "$base" =~ ^[Cc][Hh][Aa][Pp][Tt][Ee][Rr][[:space:]_.-]*([0-9]+([.][0-9]+)?)($|[[:space:]_.-]) ]]; then
-        printf '%s' "${BASH_REMATCH[1]}"
+    if [[ "$base" =~ (^|[^[:alpha:]])[Cc][Hh][[:space:]]*\.?[[:space:]]*([0-9]+([.][0-9]+)?)($|[[:space:]_.-]) ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
         return 0
     fi
 
     # ------------------------------------------------------
     # 3. Filename begins directly with a number
     #
-    # 1
-    # 01
-    # 001
-    # 72.5
-    # 12 - Title
+    # Examples:
+    #   1
+    #   01
+    #   001
+    #   72.5
+    #   12 - Title
     #
+    # This is deliberately checked AFTER explicit chapter
+    # prefixes so that:
+    #
+    #   Vol.01 Ch.0001
+    #
+    # does not incorrectly become chapter 01.
     # ------------------------------------------------------
 
     if [[ "$base" =~ ^([0-9]+([.][0-9]+)?)($|[[:space:]_.-]) ]]; then
@@ -316,7 +341,6 @@ for f in "${files[@]}"; do
     # ch001.cbz
     # ch072.5.cbz
     # ch100.cbz
-    #
     # ------------------------------------------------------
 
     if [[ "$f" =~ ^ch[0-9]{3}(\.[0-9]+)?\.cbz$ ]]; then
